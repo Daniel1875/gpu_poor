@@ -1,6 +1,6 @@
 import json
 
-if __name__ == 'main':
+if __name__ == '__main__':
     print('Usage for memory requirement:')
     print('--------------------------------')
     print('Argument name_or_size: input either a string corresponding to the name of the model or an integer denoting the size of the model in billions. The models available are as follows:')
