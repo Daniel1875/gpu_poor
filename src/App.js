@@ -765,6 +765,16 @@ function getAllComputedData(
     batchSize,
     isGradCheckPoint
 ) {
+    console.log(parsedJSONData);
+    console.log(jsonUploadedData);
+    console.log(modelSize);
+    console.log(contextLen);
+    console.log(floatType);
+    console.log(selections);
+    console.log(setErrorMessage);
+    console.log(openModal);
+    console.log(batchSize);
+    console.log(isGradCheckPoint);
     let parsedConfig = null,
         modelSizeinB = null;
     let activationMemory = 0,

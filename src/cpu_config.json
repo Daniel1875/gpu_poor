@@ -3,8 +3,8 @@
         "Speed": 0.0,
         "Bus": "Dual",
         "Cores": 6,
-        "ddr5": 0,
         "ddr4": 1,
+        "ddr5": 0,
         "speed_ddr4": 3200,
         "Memory": "DDR4",
         "Flops": 432
