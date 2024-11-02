@@ -7,7 +7,12 @@ from dataclasses import dataclass
 
 billion = 1000000000
 tera = 1000000000 * 1000
-configPath = "public/all_configs.json"
+with open("configs/all_configs.json") as json_file:
+    ModelConfigs = json.load(json_file)
+with open("configs/gpu_config.json") as json_file:
+    GPUConfigs = json.load(json_file)
+with open("configs/cpu_config.json") as json_file:
+    CPUConfigs = json.load(json_file)
 MAX_FILE_SIZE = 500000
 ggml_quants = [
     "ggml_QK4_0",
@@ -821,12 +826,6 @@ def getAllComputedData(parsedJSONData, jsonUploadedData, modelSize, contextLen, 
         "cuda + other overhead": overHead
     }
 
-async def fetch_params(name):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(configPath) as response:
-            response = await response.json()
-            return response[name] if name in response else None
-
 def isNumberOrFloat(value):
     num = float(value)
     return not math.isnan(num) and num > 0
@@ -854,8 +853,7 @@ def findMemoryRequirement(name_or_size: str | int, train_or_inference: str, trai
     jsonUploadedData = None
     modelSize = None
     if isinstance(name_or_size, str):
-        with open(configPath) as json_file:
-            parsedJSONData = json.load(json_file)[name_or_size]
+            parsedJSONData = ModelConfigs[name_or_size]
     elif isinstance(name_or_size, int):
         modelSize = name_or_size
     else:
@@ -881,7 +879,229 @@ def findMemoryRequirement(name_or_size: str | int, train_or_inference: str, trai
 
     return getAllComputedData(parsedJSONData, jsonUploadedData, modelSize, prompt_len + tokens_to_generate, 2.0, selections, None, None, batch_size, gradient_checkpointing)
 
+def getFloatRatio_F16_CPU(quantType):
+    k_values = [2, 3, 4, 5, 6, 8, 16]
+    for k in k_values:
+        if k.toString() in quantType:
+            return k / 16
+    return 1.0
+
+def getFloatRatio_F16(quant):
+    return 1.0
+
+def convertByteToMB(sizeInByte):
+    return sizeInByte / (1024 * 1024)
+
+def convertByteToGB(sizeInByte):
+    return sizeInByte / (1024 * 1024 * 1024)
+
+def findTokensPerSecond(name_or_size: str | int, train_or_inference: str, train_method: str, optimizer: str, quant: str, prompt_len: int, tokens_to_generate: int, batch_size: int, gradient_checkpointing: bool, info: InferenceCPUInfo | InferenceGPUInfo) -> dict[str, any] | None:
+    parsedJSONData = None
+    jsonUploadedData = None
+    modelSize = None
+    if isinstance(name_or_size, str):
+            parsedJSONData = ModelConfigs[name_or_size]
+    elif isinstance(name_or_size, int):
+        modelSize = name_or_size
+    else:
+        raise ValueError('go fuck yourself') # model not found
+    
+    selections = {
+        'dropdownTrnOrNot': train_or_inference,
+        'dropdownFullOrNot': train_method,
+        'dropdownOpt': optimizer,
+        'dropdownQuant': quant,
+        # line reserved for CPU and GPU
+        # line reserved for CPU and GPU
+        'isGradCheckPoint': 'yes' if gradient_checkpointing else 'no'
+    }
+    if isinstance(info, InferenceCPUInfo):
+        selections['isGPUorCPU'] = 'usingCPU'
+        selections['dropdownCPU'] = info.name
+    elif isinstance(info, InferenceGPUInfo):
+        selections['isGPUorCPU'] = 'usingGPU'
+        selections['dropdownGPU'] = info.name
+    elif info is None:
+        pass
+    else:
+        raise ValueError('go fuck yourself')
+    
+    jsonComputeReturnData = None
+
+    if train_or_inference == 'trn':
+        if isinstance(info, InferenceCPUInfo):
+            raise ValueError('inference with CPU not really useful')
+        gpu_bandwidth = GPUConfigs[info.name]["bandwidth"]
+        gpu_compute = GPUConfigs[info.name]["compute"]
+        trnType = train_or_inference
+        quantType = quant
+        totalLen = int(prompt_len) + int(tokens_to_generate)
+        bnb_cost = 1.0
+        if quantType == "bnb_int8":
+            print("Disclaimer: bitsandbytes llm.int8 quant is NOT optimized for time. It takes more time than float16")
+            bnb_cost = 3.0
+        if quantType == "bnb_q4":
+            print("Disclaimer: https://github.com/TimDettmers/bitsandbytes/releases/tag/0.41.0 says that int4/qlora is 2-4x faster but I haven't been able to reproduce this. Other people have raised similar issues.")
+            bnb_cost = 2.75
+        if quantType == "qlora":
+            print("Disclaimer: https://github.com/TimDettmers/bitsandbytes/releases/tag/0.41.0 says that int4/qlora is 2-4x faster but I haven't been able to reproduce this. Other people have raised similar issues.")
+            bnb_cost = 1.75
+        parsedConfig = getParseConfig(parsedJSONData, None, None)
+        numLayers = parsedConfig["num_layers"]
+        hiddenDim = parsedConfig["hiddenDim"]
+        memoryTransfer = computeModelSize(parsedConfig)
+        totalFlopsToken = 2 * batch_size * totalLen * memoryTransfer + totalLen * hiddenDim * 2 * numLayers * batch_size
+        extraGradChoice = 1.0
+        if optimizer == "adam_opt":
+            extraGradChoice = 1.15
+        totalFlopsToken = totalFlopsToken * 2
+        totalFlopsToken = totalFlopsToken * extraGradChoice
+        totalFlopsToken = totalFlopsToken * bnb_cost
+        if train_method == "full_trn":
+            totalFlopsToken = totalFlopsToken * 3
+        timeIfFlops_in_ms = (totalFlopsToken * 1000) / (tera * gpu_compute * 0.85)
+        memoryOrCompute = "compute"
+        if gradient_checkpointing == "yes":
+            timeIfFlops_in_ms = timeIfFlops_in_ms * 1.65
+        jsonComputeReturnData = {
+            "ms per iteration(forward + backward)": "{:.2f}".format(timeIfFlops_in_ms),
+            "memory or compute bound?": memoryOrCompute
+        }
+
+    elif train_or_inference in {'inf', 'inf_vLLM', 'inf_ggml'}:
+        if isinstance(info, InferenceCPUInfo):
+            busMap = {"Dual": 2.0, "Quad": 4.0, "Hexa": 6.0, "Octa": 8.0}
+            # print("speeds: ", speed, speed_ddr4, selections.dropdownDDR)
+            useThiSpeed = 0
+            if info.DDR == (1, 0):
+                useThiSpeed = CPUConfigs[info.name]['speed_ddr4']
+            elif info.DDR == (0, 1):
+                useThiSpeed = CPUConfigs[info.name]['Speed']
+            else:
+                raise ValueError('read the fucking documentation')
+            busValue = busMap[CPUConfigs[info.name]['Bus']]
+            rateMult = 8.0
+            cpu_bandwidth = (busValue * rateMult * useThiSpeed) / 1024
+
+            cpu_compute = CPUConfigs[info.name]["Flops"] * 0.5
+            
+            quantType = quant
+            parsedConfig = getParseConfig(parsedJSONData, None, None)
+            numLayers = parsedConfig["num_layers"]
+            hiddenDim = parsedConfig["hiddenDim"]
+            memoryTransfer = (computeModelSizeGGML(parsedConfig, quantType) * 1024 * 1024) / 2.0
+            if quantType == "no_quant":
+                memoryTransfer = computeModelSize(parsedConfig)
+            extraFactorCPU = 1.6
+            totalLen = int(tokens_to_generate) + int(prompt_len)
+            theoryTimePrompt = 2 * prompt_len * memoryTransfer + 2 * numLayers * hiddenDim * hiddenDim * 2 * prompt_len
+            theoryTimePrompt = batch_size * theoryTimePrompt
+            theoryTimePrompt_in_ms = theoryTimePrompt / (tera * (cpu_compute / 1000.0))
+            finalPromptTime = theoryTimePrompt_in_ms * getFloatRatio_F16_CPU(quantType) + convertByteToMB(2 * memoryTransfer) * (0.008 / 1000)
+            utilizationRate = 1.0
+            kv_cache_memory = 2 * 2 * numLayers * hiddenDim * totalLen
+            timeIfMemory = (convertByteToGB(2 * memoryTransfer + kv_cache_memory) / (utilizationRate * cpu_bandwidth)) * extraFactorCPU
+            timeIfMemory_in_ms = timeIfMemory * 1000
+            totalFlopsToken = 2 * memoryTransfer + 2 * totalLen * hiddenDim * 2 * numLayers * 2 * 2
+            totalFlopsToken = batch_size * totalFlopsToken
+            timeIfFlops_in_ms = (totalFlopsToken * 1000) / (tera * (cpu_compute / 1000.0))
+            timeIfFlops_in_ms = timeIfFlops_in_ms * extraFactorCPU
+            finalTimeToConsider = None
+            memoryOrCompute = None
+            if timeIfMemory_in_ms > timeIfFlops_in_ms:
+                finalTimeToConsider = timeIfMemory_in_ms
+                memoryOrCompute = "memory"
+            else:
+                finalTimeToConsider = timeIfFlops_in_ms
+                memoryOrCompute = "compute"
+            token_per_s = 1000 / finalTimeToConsider
+            jsonComputeReturnData = {
+                "Token/s": round(token_per_s) if round(token_per_s) >= 1 else "< 1",
+                "ms per token": "{:.2f}".format(finalTimeToConsider),
+                "Prompt process Time (s)": "{:.2f}".format(finalPromptTime),
+                "memory or compute bound?": memoryOrCompute
+            }
+
+        elif isinstance(info, InferenceGPUInfo):
+            gpu_bandwidth = GPUConfigs[info.name]["bandwidth"]
+            gpu_compute = GPUConfigs[info.name]["compute"]
+            trnType = train_or_inference
+            quantType = quant
+            totalLen = int(prompt_len) + int(tokens_to_generate)
+            extraFactor = 1.0
+            if trnType == "inf":
+                extraFactor = 2.0
+            if trnType == "inf_ggml":
+                extraFactor = 1.5
+                if quantType == "ggml_Q2_K":
+                    extraFactor = 2.0
+            if trnType == "inf" and train_method == "qlora":
+                raise ValueError("afaik qlora trained model's inference is just 4 bit inference, i.e. bnb int4/nf4. You can select that option from quant to calculate this")
+                return
+            bnb_cost = 1.0
+            if trnType == "inf" and quantType == "bnb_int8":
+                print("Disclaimer: bitsandbytes llm.int8 quant is NOT optimized for inference. It takes more than time than float16.")
+                bnb_cost = 4.5
+            if trnType == "inf" and quantType == "bnb_q4":
+                print("Disclaimer: https://github.com/TimDettmers/bitsandbytes/releases/tag/0.41.0 says that int4 is 2-4x faster but I haven't been able to reproduce this. Other people have raised similar issues in the repo.")
+                bnb_cost = 3.0
+            parsedConfig = getParseConfig(parsedJSONData, None, None)
+            numLayers = parsedConfig["num_layers"]
+            hiddenDim = parsedConfig["hiddenDim"]
+            memoryTransfer = 0
+            if quantType in ggml_quants:
+                memoryTransfer = (computeModelSizeGGML(parsedConfig, quantType) * 1024 * 1024) / 2.0
+            else:
+                if quantType == "no_quant":
+                    memoryTransfer = computeModelSize(parsedConfig)
+                else:
+                    if quantType == "bnb_int8":
+                        memoryTransfer = computeModelSize(parsedConfig) / 2.0
+                    if quantType == "bnb_q4":
+                        memoryTransfer = computeModelSize(parsedConfig) / 4.0
+            theoryTimePrompt = 2 * prompt_len * memoryTransfer + 2 * numLayers * hiddenDim * hiddenDim * 2 * prompt_len
+            theoryTimePrompt = batch_size * theoryTimePrompt
+            theoryTimePrompt_in_ms = theoryTimePrompt / (tera * gpu_compute * 0.85)
+            finalPromptTime = theoryTimePrompt_in_ms * getFloatRatio_F16(quantType) * 1.8 + convertByteToMB(2 * memoryTransfer) * (0.008 / 100)
+            utilizationRate = 1.0
+            kv_cache_memory = 2 * 2 * numLayers * hiddenDim * totalLen
+            timeIfMemory = convertByteToGB(2 * memoryTransfer * extraFactor + kv_cache_memory * extraFactor) / (utilizationRate * gpu_bandwidth)
+            timeIfMemory_in_ms = timeIfMemory * 1000
+            totalFlopsToken = 2 * memoryTransfer + totalLen * hiddenDim * 2 * numLayers * 2 * 2
+            timeIfFlops_in_ms = (totalFlopsToken * 1000) / (tera * gpu_compute * 0.85)
+            finalTimeToConsider = None
+            memoryOrCompute = None
+            if timeIfMemory_in_ms > timeIfFlops_in_ms:
+                finalTimeToConsider = timeIfMemory_in_ms
+                memoryOrCompute = "memory"
+            else:
+                finalTimeToConsider = timeIfFlops_in_ms
+                memoryOrCompute = "compute"
+            if not isValidPositiveInteger(info.number):
+                raise ValueError("Number of GPUs have to be positive number (>0)")
+                return
+            if info.number > 1:
+                finalTimeToConsider = (finalTimeToConsider * 1.25) / info.number
+            finalTimeToConsider = finalTimeToConsider * bnb_cost
+            finalPromptTime = finalPromptTime * bnb_cost
+            token_per_s = 1000 / finalTimeToConsider
+            jsonComputeReturnData = {
+                "Token/s": round(token_per_s) if round(token_per_s) >= 1 else "< 1",
+                "ms per token": "{:.2f}".format(finalTimeToConsider),
+                "Prompt process Time (s)": "{:.2f}".format(finalPromptTime),
+                "memory or compute bound?": memoryOrCompute
+            }
+        
+        else:
+            raise ValueError("read the fucking documentation")
+        
+    else:
+        raise ValueError("read the fucking documentation")
+    
+    return jsonComputeReturnData
+
 # for testing
 if __name__ == '__main__':
     info = InferenceGPUInfo('rtx-2060', 1)
+    print(findTokensPerSecond('meta-llama/Llama-2-7b-hf', 'inf', 'full_trn', 'adam_opt', 'no_quant', 300, 300, 1, False, info))
     print(findMemoryRequirement('meta-llama/Llama-2-7b-hf', 'inf', 'full_trn', 'adam_opt', 'no_quant', 300, 300, 1, False, info))
